@@ -3,7 +3,7 @@ import sys
 import json
 import asyncio
 import subprocess
-from typing import TypedDict, Annotated, Sequence, Any, Union
+from typing import TypedDict, Annotated, Sequence, Any
 from datetime import datetime, timedelta, timezone
 
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
@@ -26,6 +26,8 @@ CALENDAR_MCP_TOOL_NAMES = (
     "query_freebusy",
 )
 DESTRUCTIVE_MANAGE_EVENT_ACTIONS = {"update", "delete", "rsvp"}
+TAIPEI_TZ = timezone(timedelta(hours=8))
+DEFAULT_WORKSPACE_CLI_PORT = "8765"
 
 
 class AgentState(TypedDict, total=False):
@@ -114,25 +116,25 @@ def calendar_tool_route(message: BaseMessage) -> str:
     return END
 
 
-def _run_cli(command: Union[str, list[str]], timeout: int = 15, **kwargs) -> dict[str, Any]:
-    # Parse command and **kwargs into proper CLI arguments
-    args = command if isinstance(command, list) else [command]
-    
-    for key, value in kwargs.items():
-        if value is not None:
-            # Convert snake_case to kebab-case for CLI flags
-            flag = f"--{key.replace('_', '-')}"
-            if isinstance(value, bool):
-                # If boolean is True, append flag (e.g., --detailed)
-                if value:
-                    args.append(flag)
-            else:
-                args.extend([flag, str(value)])
+def _workspace_cli_url() -> str:
+    if os.environ.get("WORKSPACE_MCP_URL"):
+        return os.environ["WORKSPACE_MCP_URL"]
+    port = os.environ.get("WORKSPACE_MCP_HTTP_PORT", DEFAULT_WORKSPACE_CLI_PORT)
+    return f"http://127.0.0.1:{port}/mcp"
+
+
+def _cli_arg(name: str, value: Any) -> str:
+    if isinstance(value, bool):
+        value = str(value).lower()
+    return f"{name}={value}"
+
+
+def _run_cli(args: list[str], timeout: int = 15) -> dict[str, Any]:
 
     # Run workspace-cli subprocess with a timeout handler
     try:
         result = subprocess.run(
-            ["workspace-cli"] + args,
+            ["workspace-cli", "--url", _workspace_cli_url()] + args,
             capture_output=True,
             text=True,
             timeout=timeout
@@ -149,69 +151,63 @@ def _run_cli(command: Union[str, list[str]], timeout: int = 15, **kwargs) -> dic
 @tool  
 def cli_today_events(calendar_id: str = "primary"):
     """
-    Calculates today's UTC start and end timestamps and calls get_events to fetch today's schedule.
+    Calculates today's Taipei start and end timestamps and calls get_events to fetch today's schedule.
     No date arguments needed from the user.
     """
-    now_utc = datetime.now(timezone.utc)
-    
-    # Get 00:00:00 UTC for today
-    start_of_today = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-    # Get 23:59:59 (equivalent to 00:00:00 UTC tomorrow)
-    end_of_today = start_of_today + timedelta(days=1)
-    
-    # Convert to RFC3339 format accepted by calendar_tools.py
-    time_min = start_of_today.strftime('%Y-%m-%dT%H:%M:%SZ')
-    time_max = end_of_today.strftime('%Y-%m-%dT%H:%M:%SZ')
+    today_start = datetime.now(TAIPEI_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + timedelta(days=1)
 
-    return _run_cli(
-        "get_events", 
-        calendar_id=calendar_id, 
-        time_min=time_min, 
-        time_max=time_max
-    )
+    return _run_cli([
+        "call",
+        "get_events",
+        _cli_arg("calendar_id", calendar_id),
+        _cli_arg("time_min", today_start.isoformat()),
+        _cli_arg("time_max", today_end.isoformat()),
+        _cli_arg("max_results", 25),
+    ])
 
 @tool
-def cli_list_events(time_min: str = None, time_max: str = None, max_results: int = 25, calendar_id: str = "primary"):
+def cli_list_events(time_min: str = None, time_max: str = None, max_results: int = 10, calendar_id: str = "primary"):
     """
     General purpose event lister.
     If time_max is not provided, defaults to fetching events for 7 days from now (or from time_min).
     """
-    now_utc = datetime.now(timezone.utc)
-    
-    if not time_min:
-        time_min = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
-        
-    if not time_max:
-        # Default to 7 days later if no time_max is provided
-        time_max_dt = now_utc + timedelta(days=7)
-        time_max = time_max_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+    now = datetime.now(TAIPEI_TZ).replace(microsecond=0)
 
-    return _run_cli(
+    if not time_min:
+        time_min = now.isoformat()
+
+    if not time_max:
+        time_max = (now + timedelta(days=7)).isoformat()
+
+    return _run_cli([
+        "call",
         "get_events",
-        calendar_id=calendar_id,
-        time_min=time_min,
-        time_max=time_max,
-        max_results=max_results
-    )
+        _cli_arg("calendar_id", calendar_id),
+        _cli_arg("time_min", time_min),
+        _cli_arg("time_max", time_max),
+        _cli_arg("max_results", max_results),
+    ])
 
 @tool
 def cli_list_calendars():
     """
     Calls list_calendars tool with no arguments, returning all calendar metadata (ID, name, etc.).
     """
-    return _run_cli("list_calendars")
+    return _run_cli(["call", "list_calendars"])
 
 @tool
 def cli_get_event(event_id: str, calendar_id: str = "primary"):
     """
     Fetches full detailed information for a single event.
     """
-    return _run_cli(
+    return _run_cli([
+        "call",
         "get_events",
-        event_id=event_id,
-        calendar_id=calendar_id,
-        detailed=True
-    )
+        _cli_arg("calendar_id", calendar_id),
+        _cli_arg("event_id", event_id),
+        _cli_arg("detailed", True),
+    ])
 
 @tool
 def cli_tool_list():
