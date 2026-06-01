@@ -1,0 +1,20 @@
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+
+logs/
+.pytest_cache/
+.venv/
+venv/
+
+.DS_Store
+
+# Local source/reference material that should not be published in this repo.
+.scratch/
+AGENTS.md
+docs/agents/
+project2/
+project description with reference architecture .pdf

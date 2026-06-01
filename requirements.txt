@@ -1,0 +1,7 @@
+langchain-core==1.4.0
+langchain-google-genai==4.2.4
+langchain-mcp-adapters==0.2.2
+langgraph==1.2.2
+python-dotenv==1.2.2
+workspace-mcp==1.21.0
+pytest==9.0.3
