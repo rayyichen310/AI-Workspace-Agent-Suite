@@ -3,10 +3,10 @@ import sys
 import json
 import asyncio
 import subprocess
-from typing import TypedDict, Annotated, Sequence, Any
+from typing import TypedDict, Annotated, Sequence, Any, Union
 from datetime import datetime, timedelta, timezone
 
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, HumanMessage
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, START, END
@@ -15,33 +15,23 @@ from langgraph.prebuilt import ToolNode
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from mcp_config import setup_environment, get_mcp_config
+
+# Initialize environment
 setup_environment("calendar_mcp.log")
 
-TAIPEI_TZ = timezone(timedelta(hours=8))
-DEFAULT_WORKSPACE_CLI_PORT = "8765"
 CALENDAR_MCP_TOOL_NAMES = (
     "list_calendars",
     "get_events",
     "manage_event",
     "query_freebusy",
 )
-DESTRUCTIVE_CALENDAR_ACTIONS = {"update", "delete", "rsvp"}
-CONFIRMATION_MARKER = "[calendar-confirmation-required]"
-CONFIRMATION_WORDS = {
-    "yes",
-    "confirm",
-    "confirmed",
-    "ok",
-    "okay",
-    "proceed",
-    "確定",
-    "確認",
-    "可以",
-    "同意",
-}
+DESTRUCTIVE_MANAGE_EVENT_ACTIONS = {"update", "delete", "rsvp"}
 
-class AgentState(TypedDict):
+
+class AgentState(TypedDict, total=False):
     messages: Annotated[Sequence[BaseMessage], add_messages]
+    pending_action: dict[str, Any] | None
+    confirmed_action: dict[str, Any] | None
 
 def _print_setup_guide() -> None:
     print("Missing required environment variables. Please follow the setup guide:")
@@ -54,88 +44,95 @@ def _print_setup_guide() -> None:
     print("   export GOOGLE_OAUTH_CLIENT_SECRET=<your-client-secret>")
     print("   export USER_GOOGLE_EMAIL=<your-email>")
 
+
 def filter_calendar_mcp_tools(tools):
     tools_by_name = {tool.name: tool for tool in tools}
     return [tools_by_name[name] for name in CALENDAR_MCP_TOOL_NAMES if name in tools_by_name]
 
+
 def build_system_prompt(user_email: str, current_date: str) -> str:
     return f"""You are a highly capable Google Calendar Agent managing the calendar for {user_email}.
-    Today's date is {current_date}. 
-    The user's timezone is Asia/Taipei (UTC+8).
-    Your goal is to help the user manage their schedule.
-    
-    TOOL SELECTION RULES:
-    1. For simple, read-only queries like "What's on today?" or "List my calendars", prefer using the CLI tools (cli_today_events, cli_list_calendars) for speed.
-    2. For direct MCP calendar reads, use `list_calendars` for calendars and `get_events` for event lookup or time-range search.
-    3. For creating, updating, deleting, or RSVP responses, use `manage_event` with action "create", "update", "delete", or "rsvp".
-    4. For finding available meeting slots across attendees, use `query_freebusy`.
-    5. For update, delete, or RSVP actions, ask for explicit confirmation before calling `manage_event`.
-    6. Always format times into human-readable strings (e.g., "3:00 PM" instead of raw ISO format) when replying to the user.
-    7. CRITICAL TIMEZONE RULE: When creating or updating events, ALWAYS include the timezone offset in the ISO timestamp (e.g., "2026-05-29T13:00:00+08:00"). Do not use 'Z' (UTC) unless explicitly calculating a timezone difference.
-    8. You already know the user's email is {user_email}. Do not ask for it.
-    """
+        Current Date: {current_date}
+        Timezone: Asia/Taipei (UTC+8)
 
-def _message_text(message: BaseMessage) -> str:
-    content = message.content
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, dict):
-                parts.append(str(block.get("text", "")))
-            else:
-                parts.append(str(block))
-        return " ".join(parts)
-    return str(content)
+        Your primary goal is to help the user efficiently manage their schedule.
 
-def _latest_human_text(messages: Sequence[BaseMessage]) -> str:
-    for message in reversed(messages):
-        if isinstance(message, HumanMessage):
-            return _message_text(message)
-    return ""
+        TOOL SELECTION GUIDE (CLI vs MCP)
+        1. READ-ONLY / FAST QUERIES: Prefer CLI tools for simple scheduling questions like "What is on my calendar today?" or "List my events".
+        2. DIRECT MCP READS: Use `list_calendars` for calendars, `get_events` for event lookup or time-range search, and `query_freebusy` for availability.
+        3. MUTATIONS: Use `manage_event` with action "create", "update", "delete", or "rsvp".
 
-def _has_pending_calendar_confirmation(messages: Sequence[BaseMessage]) -> bool:
-    return any(
-        isinstance(message, AIMessage) and CONFIRMATION_MARKER in _message_text(message)
-        for message in messages
-    )
+        SAFETY AND CONFIRMATION RULES
+        - DESTRUCTIVE OPERATIONS: For update, delete, or rsvp actions, ask for explicit confirmation before calling `manage_event`.
+        - EVENT CREATION: Use `manage_event` with action "create" for scheduling meetings.
 
-def _is_confirmation_text(text: str) -> bool:
-    normalized = text.strip().lower()
-    return any(word in normalized for word in CONFIRMATION_WORDS)
+        FORMATTING AND DATA RULES
+        - HUMAN-READABLE TIME: Always convert raw ISO timestamps from tool outputs into natural, human-readable formats (e.g., "3:00 PM", "Tomorrow at 10:00 AM") when replying to the user.
+        - TIMEZONE HANDLING: When passing time data to tools for creating or updating events, ALWAYS append the correct timezone offset (e.g., "2026-05-29T13:00:00+08:00"). Do not use 'Z' (UTC) unless explicitly calculating a timezone difference.
+        - USER CONTEXT: You already know the user's email is {user_email}. Do not ask for it.
+        """
 
-def _destructive_manage_event_action(response: BaseMessage) -> str | None:
-    for tool_call in getattr(response, "tool_calls", []) or []:
+
+def destructive_manage_event_tool_call(message: BaseMessage) -> dict[str, Any] | None:
+    for tool_call in getattr(message, "tool_calls", []) or []:
         if tool_call.get("name") != "manage_event":
             continue
         action = str(tool_call.get("args", {}).get("action", "")).strip().lower()
-        if action in DESTRUCTIVE_CALENDAR_ACTIONS:
-            return action
+        if action in DESTRUCTIVE_MANAGE_EVENT_ACTIONS:
+            return dict(tool_call)
     return None
 
-def enforce_calendar_mutation_confirmation(state: AgentState, response: BaseMessage) -> BaseMessage:
-    action = _destructive_manage_event_action(response)
-    if action is None:
-        return response
 
-    messages = list(state["messages"])
-    if _has_pending_calendar_confirmation(messages) and _is_confirmation_text(_latest_human_text(messages)):
-        return response
-
-    return AIMessage(
-        content=(
-            f"{CONFIRMATION_MARKER}\n"
-            f"Please confirm before I {action} this calendar event. "
-            "Reply with an explicit confirmation to proceed."
-        )
+def format_pending_action_message(tool_call: dict[str, Any]) -> str:
+    action = str(tool_call.get("args", {}).get("action", "modify")).strip() or "modify"
+    serialized_tool_call = json.dumps(tool_call, ensure_ascii=False, indent=2)
+    return (
+        "This calendar action requires confirmation before it can run.\n\n"
+        f"Pending action: manage_event action={action}\n"
+        "Stored tool call:\n"
+        f"{serialized_tool_call}\n\n"
+        "Choose one option:\n"
+        "1. Confirm\n"
+        "2. Cancel"
     )
 
-def _run_cli(args: list[str], timeout: int = 15) -> dict[str, Any]:
+
+def parse_pending_action_choice(text: str) -> str | None:
+    normalized = " ".join(text.strip().lower().replace(".", " ").split())
+    if normalized in {"1", "1 confirm"}:
+        return "confirm"
+    if normalized in {"2", "2 cancel"}:
+        return "cancel"
+    return None
+
+
+def calendar_tool_route(message: BaseMessage) -> str:
+    if destructive_manage_event_tool_call(message):
+        return "confirmation"
+    if hasattr(message, "tool_calls") and message.tool_calls:
+        return "tools"
+    return END
+
+
+def _run_cli(command: Union[str, list[str]], timeout: int = 15, **kwargs) -> dict[str, Any]:
+    # Parse command and **kwargs into proper CLI arguments
+    args = command if isinstance(command, list) else [command]
+    
+    for key, value in kwargs.items():
+        if value is not None:
+            # Convert snake_case to kebab-case for CLI flags
+            flag = f"--{key.replace('_', '-')}"
+            if isinstance(value, bool):
+                # If boolean is True, append flag (e.g., --detailed)
+                if value:
+                    args.append(flag)
+            else:
+                args.extend([flag, str(value)])
+
     # Run workspace-cli subprocess with a timeout handler
     try:
         result = subprocess.run(
-            ["workspace-cli", "--url", _workspace_cli_url()] + args,
+            ["workspace-cli"] + args,
             capture_output=True,
             text=True,
             timeout=timeout
@@ -149,96 +146,136 @@ def _run_cli(args: list[str], timeout: int = 15) -> dict[str, Any]:
     except Exception as e:
         return {"error": str(e)}
 
-def _workspace_cli_url() -> str:
-    if os.environ.get("WORKSPACE_MCP_URL"):
-        return os.environ["WORKSPACE_MCP_URL"]
-    port = os.environ.get("WORKSPACE_MCP_HTTP_PORT", DEFAULT_WORKSPACE_CLI_PORT)
-    return f"http://127.0.0.1:{port}/mcp"
+@tool  
+def cli_today_events(calendar_id: str = "primary"):
+    """
+    Calculates today's UTC start and end timestamps and calls get_events to fetch today's schedule.
+    No date arguments needed from the user.
+    """
+    now_utc = datetime.now(timezone.utc)
+    
+    # Get 00:00:00 UTC for today
+    start_of_today = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Get 23:59:59 (equivalent to 00:00:00 UTC tomorrow)
+    end_of_today = start_of_today + timedelta(days=1)
+    
+    # Convert to RFC3339 format accepted by calendar_tools.py
+    time_min = start_of_today.strftime('%Y-%m-%dT%H:%M:%SZ')
+    time_max = end_of_today.strftime('%Y-%m-%dT%H:%M:%SZ')
 
-def _cli_arg(name: str, value: Any) -> str:
-    if isinstance(value, bool):
-        value = str(value).lower()
-    return f"{name}={value}"
+    return _run_cli(
+        "get_events", 
+        calendar_id=calendar_id, 
+        time_min=time_min, 
+        time_max=time_max
+    )
+
+@tool
+def cli_list_events(time_min: str = None, time_max: str = None, max_results: int = 25, calendar_id: str = "primary"):
+    """
+    General purpose event lister.
+    If time_max is not provided, defaults to fetching events for 7 days from now (or from time_min).
+    """
+    now_utc = datetime.now(timezone.utc)
+    
+    if not time_min:
+        time_min = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+        
+    if not time_max:
+        # Default to 7 days later if no time_max is provided
+        time_max_dt = now_utc + timedelta(days=7)
+        time_max = time_max_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    return _run_cli(
+        "get_events",
+        calendar_id=calendar_id,
+        time_min=time_min,
+        time_max=time_max,
+        max_results=max_results
+    )
 
 @tool
 def cli_list_calendars():
-    """What calendars do I have? Call this to list all calendars and get their IDs."""
-    return _run_cli(["call", "list_calendars"])
-
-@tool
-def cli_today_events(calendar_id: str = "primary"):
-    """What's on today? Fast CLI tool to list today's events."""
-    today_start = datetime.now(TAIPEI_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-    today_end = today_start + timedelta(days=1)
-    return _run_cli([
-        "call",
-        "get_events",
-        _cli_arg("calendar_id", calendar_id),
-        _cli_arg("time_min", today_start.isoformat()),
-        _cli_arg("time_max", today_end.isoformat()),
-        _cli_arg("max_results", 25),
-    ])
-
-@tool
-def cli_list_events(time_min: str = None, time_max: str = None, max_results: int = 10, calendar_id: str = "primary"):
-    """Show me this week. Fast CLI tool for listing events."""
-    now = datetime.now(TAIPEI_TZ).replace(microsecond=0)
-    if not time_min:
-        time_min = now.isoformat()
-    if not time_max:
-        time_max = (now + timedelta(days=7)).isoformat()
-    
-    args = [
-        "call",
-        "get_events",
-        _cli_arg("calendar_id", calendar_id),
-        _cli_arg("time_min", time_min),
-        _cli_arg("time_max", time_max),
-        _cli_arg("max_results", max_results),
-    ]
-    
-    return _run_cli(args)
+    """
+    Calls list_calendars tool with no arguments, returning all calendar metadata (ID, name, etc.).
+    """
+    return _run_cli("list_calendars")
 
 @tool
 def cli_get_event(event_id: str, calendar_id: str = "primary"):
-    """Get details for that meeting. Fast CLI tool to fetch a single event."""
-    return _run_cli([
-        "call",
+    """
+    Fetches full detailed information for a single event.
+    """
+    return _run_cli(
         "get_events",
-        _cli_arg("calendar_id", calendar_id),
-        _cli_arg("event_id", event_id),
-        _cli_arg("detailed", True),
-    ])
+        event_id=event_id,
+        calendar_id=calendar_id,
+        detailed=True
+    )
 
 @tool
 def cli_tool_list():
-    """Debug/tool discovery. Fast CLI tool to enumerate all workspace-cli tools."""
+    """
+    Debug and tool discovery. Fast CLI tool to enumerate all workspace-cli tools.
+    """
     return _run_cli(["list"])
 
 async def build_agent(mcp_client: MultiServerMCPClient):
-    mcp_tools = filter_calendar_mcp_tools(await mcp_client.get_tools())
-    # Merge MCP tools with all CLI tools
+    # 1. Retrieve all MCP tools
+    raw_mcp_tools = await mcp_client.get_tools()
+    filtered_mcp_tools = filter_calendar_mcp_tools(raw_mcp_tools)
+            
+    # Extract the names from the filtered tool objects
+    tool_names = [getattr(t, "name", "unknown") for t in filtered_mcp_tools]
+    
+    # Print the count and the joined list of names
+    print(f"[INFO] Filtered and loaded {len(filtered_mcp_tools)} calendar-related MCP tools: {', '.join(tool_names)}")
+    
+    # 3. Merge MCP tools with all CLI tools
     cli_tools = [cli_list_calendars, cli_today_events, cli_list_events, cli_get_event, cli_tool_list]
-    all_tools = mcp_tools + cli_tools
+    all_tools = filtered_mcp_tools + cli_tools
 
+    # 4. Initialize LLM and bind combined tools
     llm = ChatGoogleGenerativeAI(model="gemma-4-31b-it", temperature=0)
     llm_with_tools = llm.bind_tools(all_tools)
 
     current_date = datetime.now().strftime("%Y-%m-%d, %A")
     user_email = os.environ.get("USER_GOOGLE_EMAIL", "your primary email")
 
-    SYSTEM_PROMPT = build_system_prompt(user_email=user_email, current_date=current_date)
+    SYSTEM_PROMPT = build_system_prompt(user_email, current_date)
 
     def agent_node(state: AgentState):
-        messages = state["messages"]
+        messages = list(state["messages"])
         if not messages or not isinstance(messages[0], SystemMessage):
-            messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
+            messages.insert(0, SystemMessage(content=SYSTEM_PROMPT))
             
         response = llm_with_tools.invoke(messages)
-        response = enforce_calendar_mutation_confirmation(state, response)
         return {"messages": [response]}
 
+    def confirmed_action_node(state: AgentState):
+        return {
+            "messages": [AIMessage(content="", tool_calls=[state["confirmed_action"]])],
+            "confirmed_action": None,
+        }
+
+    def confirmation_node(state: AgentState):
+        last_message = state["messages"][-1]
+        pending_action = destructive_manage_event_tool_call(last_message)
+        return {
+            "messages": [AIMessage(content=format_pending_action_message(pending_action))],
+            "pending_action": pending_action,
+        }
+
+    def start_route(state: AgentState) -> str:
+        if state.get("confirmed_action"):
+            return "confirmed_action"
+        return "agent"
+
     def should_continue(state: AgentState) -> str:
+        last_message = state["messages"][-1]
+        return calendar_tool_route(last_message)
+
+    def should_execute_confirmed_action(state: AgentState) -> str:
         last_message = state["messages"][-1]
         if hasattr(last_message, "tool_calls") and last_message.tool_calls:
             return "tools"
@@ -246,39 +283,53 @@ async def build_agent(mcp_client: MultiServerMCPClient):
 
     workflow = StateGraph(AgentState)
     workflow.add_node("agent", agent_node)
+    workflow.add_node("confirmed_action", confirmed_action_node)
+    workflow.add_node("confirmation", confirmation_node)
     workflow.add_node("tools", ToolNode(all_tools))
 
-    workflow.add_edge(START, "agent")
+    workflow.add_conditional_edges(START, start_route)
     workflow.add_conditional_edges("agent", should_continue)
+    workflow.add_conditional_edges("confirmed_action", should_execute_confirmed_action)
+    workflow.add_edge("confirmation", END)
     workflow.add_edge("tools", "agent")
 
     return workflow.compile()
 
-async def process_agent_stream(agent, initial_messages) -> str:
-    # Process Agent stream, accurately parse and print detailed progress of each tool execution
+async def process_agent_stream(
+    agent,
+    initial_messages,
+    confirmed_action: dict[str, Any] | None = None,
+    return_pending: bool = False,
+):
+    # Process Agent stream, parse accurately and print tool execution progress
     final_message_content = None
+    pending_action = None
+    initial_state = {"messages": initial_messages}
+    if confirmed_action:
+        initial_state["confirmed_action"] = confirmed_action
     
-    async for event in agent.astream({"messages": initial_messages}):
+    async for event in agent.astream(initial_state):
         for node_name, state_update in event.items():
-            if node_name == "agent":
+            if node_name in {"agent", "confirmed_action", "confirmation"}:
                 last_msg = state_update["messages"][-1]
                 if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
                     for tool_call in last_msg.tool_calls:
                         name = tool_call["name"]
-                        args = tool_call.get("args", {})
                         
-                        # Print the AI's intended action
+                        # Print the AI's intended action without emojis
                         if "cli_" in name:
                             sys.stdout.write(f"[Action] Executing fast CLI tool '{name}'...\n")
                         elif "create" in name:
                             sys.stdout.write(f"[Action] Creating calendar event...\n")
-                        elif "list" in name:
+                        elif "list" in name or "get" in name:
                             sys.stdout.write(f"[Action] Searching calendar events...\n")
                         else:
                             sys.stdout.write(f"[Action] Running tool '{name}'...\n")
                         sys.stdout.flush()
                 else:
                     final_message_content = last_msg.content
+                    if node_name == "confirmation":
+                        pending_action = state_update.get("pending_action")
                     
             elif node_name == "tools":
                 sys.stdout.write("[System] Action executed successfully.\n")
@@ -289,13 +340,17 @@ async def process_agent_stream(agent, initial_messages) -> str:
         for block in final_message_content:
             if isinstance(block, dict) and block.get("type") == "text":
                 display_text += block.get("text", "")
+            elif isinstance(block, str):
+                display_text += block
     else:
         display_text = str(final_message_content)
-        
+
+    if return_pending:
+        return display_text, pending_action
     return display_text
 
 async def run_demo(agent) -> None:
-    # Iterate over three pre-written demo queries without requiring user input
+    # Iterate over three pre-written demo queries without user input
     demo_queries = [
         "What calendars do I have?",
         "What's on my calendar today?",
@@ -322,6 +377,7 @@ async def run_interactive_chat(agent):
     
     # Maintain full conversation history
     chat_history = []
+    pending_action = None
     
     while True:
         sys.stdout.write("\nYou: ")
@@ -330,12 +386,35 @@ async def run_interactive_chat(agent):
         
         if not user_input or user_input.lower() in ['quit', 'exit']:
             break
-            
-        chat_history.append(HumanMessage(content=user_input))
-        display_text = await process_agent_stream(agent, chat_history)
+
+        if pending_action:
+            choice = parse_pending_action_choice(user_input)
+            if choice == "confirm":
+                chat_history.append(HumanMessage(content=user_input))
+                display_text, _ = await process_agent_stream(
+                    agent,
+                    chat_history,
+                    confirmed_action=pending_action,
+                    return_pending=True,
+                )
+                pending_action = None
+            elif choice == "cancel":
+                chat_history.append(HumanMessage(content=user_input))
+                pending_action = None
+                display_text = "Cancelled. I did not modify the calendar event."
+            else:
+                print("\nAgent:\nPlease choose one option: 1. Confirm or 2. Cancel.")
+                continue
+        else:
+            chat_history.append(HumanMessage(content=user_input))
+            display_text, pending_action = await process_agent_stream(
+                agent,
+                chat_history,
+                return_pending=True,
+            )
             
         print(f"\nAgent:\n{display_text.strip()}")
-        chat_history.append(BaseMessage(content=display_text, type="ai"))
+        chat_history.append(AIMessage(content=display_text))
 
 async def main():
     required_envs = ["GOOGLE_API_KEY", "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "USER_GOOGLE_EMAIL"]
