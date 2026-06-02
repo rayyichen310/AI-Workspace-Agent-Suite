@@ -6,7 +6,7 @@ import subprocess
 from typing import TypedDict, Annotated, Sequence, Any
 from datetime import datetime, timedelta, timezone
 
-from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, START, END
@@ -60,9 +60,11 @@ def build_system_prompt(user_email: str, current_date: str) -> str:
         Your primary goal is to help the user efficiently manage their schedule.
 
         TOOL SELECTION GUIDE (CLI vs MCP)
-        1. READ-ONLY / FAST QUERIES: Prefer CLI tools for simple scheduling questions like "What is on my calendar today?" or "List my events".
+        1. READ-ONLY / FAST QUERIES: Use cli_today_events for today's schedule, and cli_list_events for "upcoming", "this week", or general inquiries without a specific date.
         2. DIRECT MCP READS: Use `list_calendars` for calendars, `get_events` for event lookup or time-range search, and `query_freebusy` for availability.
         3. MUTATIONS: Use `manage_event` with action "create", "update", "delete", or "rsvp".
+
+        ATTENDEES RULE: When scheduling a meeting with someone, you MUST always include their exact email address in the attendees parameter. Never pass an empty email or just a name.
 
         SAFETY AND CONFIRMATION RULES
         - DESTRUCTIVE OPERATIONS: For update, delete, or rsvp actions, ask for explicit confirmation before calling `manage_event`.
@@ -151,8 +153,8 @@ def _run_cli(args: list[str], timeout: int = 15) -> dict[str, Any]:
 @tool  
 def cli_today_events(calendar_id: str = "primary"):
     """
-    Calculates today's Taipei start and end timestamps and calls get_events to fetch today's schedule.
-    No date arguments needed from the user.
+    Use this tool ONLY when the user explicitly asks for "today's" schedule.
+    Calculates today's Taipei start and end timestamps and calls get_events.
     """
     today_start = datetime.now(TAIPEI_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
     today_end = today_start + timedelta(days=1)
@@ -169,8 +171,8 @@ def cli_today_events(calendar_id: str = "primary"):
 @tool
 def cli_list_events(time_min: str = None, time_max: str = None, max_results: int = 10, calendar_id: str = "primary"):
     """
-    General purpose event lister.
-    If time_max is not provided, defaults to fetching events for 7 days from now (or from time_min).
+    Use this tool as the DEFAULT for general schedule inquiries.
+    If time_max is not provided, it fetches events for the upcoming 7 days, giving the user a good overview of their week.
     """
     now = datetime.now(TAIPEI_TZ).replace(microsecond=0)
 
@@ -215,6 +217,37 @@ def cli_tool_list():
     Debug and tool discovery. Fast CLI tool to enumerate all workspace-cli tools.
     """
     return _run_cli(["list"])
+
+class SafeToolNode(ToolNode):
+    """
+    Custom ToolNode used to intercept execution crashes,
+    prevent the script from exiting, and return the error message to the LLM.
+    """
+    async def ainvoke(self, input: dict, config: dict, **kwargs):
+        try:
+            # Execute all tools normally
+            return await super().ainvoke(input, config, **kwargs)
+        except Exception as e:
+            # Intercept exception when an error occurs during tool execution
+            print(f"\n[System] Tool execution failed intercepted: {e}")
+
+            # Retrieve the tool_calls the LLM just attempted to execute
+            last_message = input["messages"][-1]
+            tool_calls = getattr(last_message, "tool_calls", [])
+
+            # Wrap the error messages into corresponding ToolMessage objects to feed back to the LLM
+            tool_messages = []
+            for tc in tool_calls:
+                tool_messages.append(
+                    ToolMessage(
+                        content=f"Tool Execution Error: {str(e)}. Please review your parameters, fix the issue, and try again.",
+                        name=tc["name"],
+                        tool_call_id=tc["id"]
+                    )
+                )
+
+            # Return the error messages, allowing the Agent to enter the next reasoning loop
+            return {"messages": tool_messages}
 
 async def build_agent(mcp_client: MultiServerMCPClient):
     # 1. Retrieve all MCP tools
@@ -281,7 +314,8 @@ async def build_agent(mcp_client: MultiServerMCPClient):
     workflow.add_node("agent", agent_node)
     workflow.add_node("confirmed_action", confirmed_action_node)
     workflow.add_node("confirmation", confirmation_node)
-    workflow.add_node("tools", ToolNode(all_tools))
+    # workflow.add_node("tools", ToolNode(all_tools))
+    workflow.add_node("tools", SafeToolNode(all_tools))
 
     workflow.add_conditional_edges(START, start_route)
     workflow.add_conditional_edges("agent", should_continue)

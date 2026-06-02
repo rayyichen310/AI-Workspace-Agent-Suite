@@ -194,7 +194,11 @@ async def initialize_calendar_data(client: MultiServerMCPClient, reset_team_lunc
         )
 
 
-async def initialize_refund_data(client: MultiServerMCPClient, send_missing: bool) -> None:
+async def initialize_refund_data(
+    client: MultiServerMCPClient,
+    send_missing: bool,
+    force_send: bool,
+) -> None:
     print_section("Initializing refund demo data")
     search = await get_tool(client, "search_gmail_messages")
     missing_emails = []
@@ -207,7 +211,13 @@ async def initialize_refund_data(client: MultiServerMCPClient, send_missing: boo
         else:
             print(f"Already present: {subject}")
 
+    if force_send:
+        print("Force-send enabled. Sending a fresh copy of all refund demo emails.")
+        missing_emails = REFUND_EMAILS
+
     if not missing_emails:
+        if send_missing:
+            print("All refund email fixtures are already present. No emails were sent.")
         return
 
     if not send_missing:
@@ -276,6 +286,7 @@ async def main() -> None:
     parser.add_argument("--init-only", action="store_true")
     parser.add_argument("--keep-team-lunch", action="store_true")
     parser.add_argument("--send-missing-refund-emails", action="store_true")
+    parser.add_argument("--force-send-refund-emails", action="store_true")
     args = parser.parse_args()
 
     require_env()
@@ -298,7 +309,11 @@ async def main() -> None:
         refund_client = MultiServerMCPClient(get_mcp_config("refund"))
         try:
             if not args.skip_refund_init:
-                await initialize_refund_data(refund_client, args.send_missing_refund_emails)
+                await initialize_refund_data(
+                    refund_client,
+                    args.send_missing_refund_emails,
+                    args.force_send_refund_emails,
+                )
             if run_refund_agent:
                 await run_refund_pdf_prompt(refund_client)
         finally:
